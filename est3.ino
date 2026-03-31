@@ -1,5 +1,5 @@
 // Arduino code for measuring resistance with capacitor and RNN
-// Sequential processing version - Corrected Backprop + Calibration Mode
+// Sequential processing version - Corrected Backprop + Calibration Mode + Optimized SGD
 
 #include <math.h>
 
@@ -13,6 +13,8 @@
 #define inputSize 3
 #define outputSize 1
 #define learningRate 0.01
+#define momentum 0.9
+#define gradClip 1.0
 
 // Normalization factors
 #define T_MAX 100000.0
@@ -25,6 +27,13 @@ float Whh[hiddenSize][hiddenSize];
 float Why[outputSize][hiddenSize];
 float bh[hiddenSize];
 float by[outputSize];
+
+// Momentum buffers
+float vWxh[hiddenSize][inputSize];
+float vWhh[hiddenSize][hiddenSize];
+float vWhy[outputSize][hiddenSize];
+float vbh[hiddenSize];
+float vby[outputSize];
 
 // RNN states
 float h[hiddenSize];
@@ -113,7 +122,6 @@ void loop() {
 
   float predictedR = y[0] * R_MAX;
 
-  // Basic calculation for reference
   float avgD = 0;
   for(int i=0; i<10; i++) avgD += x_history[i][0] * T_MAX;
   float calculatedR = (avgD/10.0 / 1000000.0) / 0.000001;
@@ -134,10 +142,6 @@ void loop() {
         Serial.println(knownR);
         rnnBackwardAndUpdate(10);
     }
-  } else {
-    // In normal mode, we can still perform "self-supervised" update or skip
-    // For now, let's skip training in normal mode to prevent divergence
-    // rnnBackwardAndUpdate(10);
   }
 
   delay(2000);
@@ -154,6 +158,12 @@ void rnnForward() {
     y[i] = by[i];
     for (int j = 0; j < hiddenSize; j++) y[i] += Why[i][j] * h[j];
   }
+}
+
+float clip(float val) {
+    if (val > gradClip) return gradClip;
+    if (val < -gradClip) return -gradClip;
+    return val;
 }
 
 void rnnBackwardAndUpdate(int steps) {
@@ -192,27 +202,39 @@ void rnnBackwardAndUpdate(int steps) {
         }
     }
 
+    // Update with Clipping and Momentum
     for (int i = 0; i < hiddenSize; i++) {
-        bh[i] -= learningRate * dbh[i];
-        for (int j = 0; j < inputSize; j++) Wxh[i][j] -= learningRate * dWxh[i][j];
-        for (int k = 0; k < hiddenSize; k++) Whh[i][k] -= learningRate * dWhh[i][k];
+        vbh[i] = momentum * vbh[i] - learningRate * clip(dbh[i]);
+        bh[i] += vbh[i];
+        for (int j = 0; j < inputSize; j++) {
+            vWxh[i][j] = momentum * vWxh[i][j] - learningRate * clip(dWxh[i][j]);
+            Wxh[i][j] += vWxh[i][j];
+        }
+        for (int k = 0; k < hiddenSize; k++) {
+            vWhh[i][k] = momentum * vWhh[i][k] - learningRate * clip(dWhh[i][k]);
+            Whh[i][k] += vWhh[i][k];
+        }
     }
     for (int i = 0; i < outputSize; i++) {
-        by[i] -= learningRate * dby[i];
-        for (int j = 0; j < hiddenSize; j++) Why[i][j] -= learningRate * dWhy[i][j];
+        vby[i] = momentum * vby[i] - learningRate * clip(dby[i]);
+        by[i] += vby[i];
+        for (int j = 0; j < hiddenSize; j++) {
+            vWhy[i][j] = momentum * vWhy[i][j] - learningRate * clip(dWhy[i][j]);
+            Why[i][j] += vWhy[i][j];
+        }
     }
 }
 
 void rnnInit() {
   float scale = 0.1;
   for (int i = 0; i < hiddenSize; i++) {
-    bh[i] = 0;
-    for (int j = 0; j < inputSize; j++) Wxh[i][j] = (random(-1000, 1000) / 1000.0) * scale;
-    for (int k = 0; k < hiddenSize; k++) Whh[i][k] = (random(-1000, 1000) / 1000.0) * scale;
+    bh[i] = 0; vbh[i] = 0;
+    for (int j = 0; j < inputSize; j++) { Wxh[i][j] = (random(-1000, 1000) / 1000.0) * scale; vWxh[i][j] = 0; }
+    for (int k = 0; k < hiddenSize; k++) { Whh[i][k] = (random(-1000, 1000) / 1000.0) * scale; vWhh[i][k] = 0; }
   }
   for (int i = 0; i < outputSize; i++) {
-    by[i] = 0;
-    for (int j = 0; j < hiddenSize; j++) Why[i][j] = (random(-1000, 1000) / 1000.0) * scale;
+    by[i] = 0; vby[i] = 0;
+    for (int j = 0; j < hiddenSize; j++) { Why[i][j] = (random(-1000, 1000) / 1000.0) * scale; vWhy[i][j] = 0; }
   }
 }
 
