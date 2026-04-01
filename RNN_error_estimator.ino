@@ -1,282 +1,170 @@
 // Arduino code for measuring resistance with capacitor and RNN
-// Sequential processing version - Corrected Backprop + Calibration Mode + Optimized SGD
-// Consolidate and finalize production version
+// Sequential processing version - BPTT + Calibration Mode + RMSprop Optimizer
+// Optimized for Arduino Uno (ATmega328P) - RAM optimized v1.5
 
 #include <math.h>
+#include <EEPROM.h>
 
 // --- Pin Definitions ---
-#define analogPin 0   // RC measurement node
-#define chargePin 13  // Charging digital pin
-#define dividerPin 1 // Supply voltage divider node
+#define analogPin 0
+#define chargePin 13
+#define dividerPin 1
 
 // --- Measurement Constants ---
-#define threshold 648 // ~63.2% of 1023 (Target voltage for tau measurement)
-#define knownCapacitor 0.000001 // 1 uF capacitor
+#define threshold 648
+#define knownCapacitor 0.000001
+#define timeout_ms 2000
 
 // --- RNN Hyperparameters ---
-#define hiddenSize 8
-#define inputSize 3  // Pulse duration, pulse index, supply voltage
+#define hiddenSize 6
+#define inputSize 4
 #define outputSize 1
-#define learningRate 0.01
-#define momentum 0.9
+#define learningRate 0.001
+#define rho 0.9
+#define epsilon 1e-8
 #define gradClip 1.0
+#define l2Reg 0.0001
 
-// --- Normalization Factors ---
-#define T_MAX 100000.0 // Normalization for pulse duration (us)
-#define V_REF 5.0      // Normalization for supply voltage
-#define R_MAX 100000.0 // Normalization for predicted resistance
+// --- Normalization Factors (Log Scaling) ---
+#define LOG_T_MIN 0.0
+#define LOG_T_MAX 6.0
+#define V_REF 5.0
+#define LOG_R_MIN 2.0
+#define LOG_R_MAX 6.0
 
-// --- RNN Weights and Biases ---
+// --- RNN Weights and Biases (Global) ---
 float Wxh[hiddenSize][inputSize];
 float Whh[hiddenSize][hiddenSize];
 float Why[outputSize][hiddenSize];
-float bh[hiddenSize];
-float by[outputSize];
+float bh[hiddenSize], by[outputSize];
 
-// --- Optimizer State (Momentum Buffers) ---
-float vWxh[hiddenSize][inputSize];
-float vWhh[hiddenSize][hiddenSize];
-float vWhy[outputSize][hiddenSize];
-float vbh[hiddenSize];
-float vby[outputSize];
+// --- RMSprop Moving Average Squared Gradients (Global) ---
+float sWxh[hiddenSize][inputSize], sWhh[hiddenSize][hiddenSize], sWhy[outputSize][hiddenSize];
+float sbh[hiddenSize], sby[outputSize];
 
 // --- RNN Dynamic States ---
-float h[hiddenSize];
-float h_prev[hiddenSize];
-float y[outputSize];
+float h[hiddenSize], h_prev[hiddenSize], y[outputSize];
 
-// --- RNN Inputs and Training Targets ---
-float x[inputSize];
-float t[outputSize];
+// --- History for BPTT (6 steps for Uno RAM) ---
+#define bpttSteps 6
+float h_history[bpttSteps + 1][hiddenSize];
+float x_history[bpttSteps][inputSize];
 
-// --- Sequence History for Backpropagation Through Time (BPTT) ---
-float h_history[11][hiddenSize];
-float x_history[11][inputSize];
-
-// --- Application State ---
 bool calibrationMode = false;
 
 void setup() {
-  pinMode(chargePin, OUTPUT);
-  digitalWrite(chargePin, LOW);
-  Serial.begin(9600);
-
-  // Use floating analog pin for better randomness
+  pinMode(chargePin, OUTPUT); digitalWrite(chargePin, LOW); Serial.begin(9600);
   randomSeed(analogRead(5));
-  rnnInit();
-
-  Serial.println(F("RNN Resistor Estimator v1.0 Ready."));
-  Serial.println(F("Send 'C' to toggle Calibration Mode."));
+  if (!loadWeights()) { rnnInit(); Serial.println(F("Init.")); }
+  else Serial.println(F("Loaded."));
 }
 
 void loop() {
-  // Handle user commands
   if (Serial.available() > 0) {
     char c = Serial.read();
-    if (c == 'C' || c == 'c') {
-      calibrationMode = !calibrationMode;
-      Serial.print(F("Calibration Mode: "));
-      Serial.println(calibrationMode ? F("ON") : F("OFF"));
-      if (calibrationMode) Serial.println(F("Ready to train. Please provide known R when prompted."));
-    }
+    if (c == 'C' || c == 'c') { calibrationMode = !calibrationMode; Serial.print(F("Cal: ")); Serial.println(calibrationMode ? F("ON") : F("OFF")); }
+    else if (c == 'S' || c == 's') { saveWeights(); Serial.println(F("Saved.")); }
+    else if (c == 'R' || c == 'r') { rnnInit(); Serial.println(F("Reset.")); }
   }
 
-  unsigned long startTime;
-  unsigned long pulseDuration;
-  int pulseCount = 0;
+  unsigned long startTime, pulseDuration, loopStart; int pulseCount = 0;
+  pinMode(chargePin, OUTPUT); digitalWrite(chargePin, LOW); loopStart = millis();
+  while (analogRead(analogPin) > 5) { if (millis() - loopStart > timeout_ms) return; }
 
-  // 1. Discharge the capacitor
-  pinMode(chargePin, OUTPUT);
-  digitalWrite(chargePin, LOW);
-  while (analogRead(analogPin) > 5) { delay(1); }
-
-  // 2. Measure supply voltage (using internal 1.1V ref for absolute accuracy)
-  pinMode(chargePin, INPUT);
-  analogReference(INTERNAL);
-  analogRead(dividerPin); // Stabilize ADC MUX
-  delay(10);
+  pinMode(chargePin, INPUT); analogReference(INTERNAL); analogRead(dividerPin); delay(10);
   float supplyVoltage = analogRead(dividerPin) * (1.1 / 1023.0) * 11.0;
-  analogReference(DEFAULT);
-  analogRead(analogPin); // Clear MUX for next measurement
+  analogReference(DEFAULT); analogRead(analogPin);
 
-  // 3. Reset RNN state for a new sequence
   rnnReset();
-
-  // 4. Perform sequential measurements
   pinMode(chargePin, OUTPUT);
   while (pulseCount < 10) {
-    digitalWrite(chargePin, HIGH);
-    startTime = micros();
-    while(analogRead(analogPin) < threshold) {
-        // Optional timeout here
-    }
+    float residualADC = analogRead(analogPin);
+    digitalWrite(chargePin, HIGH); startTime = micros(); loopStart = millis();
+    while(analogRead(analogPin) < threshold) { if (millis() - loopStart > timeout_ms) { digitalWrite(chargePin, LOW); return; } }
     pulseDuration = micros() - startTime;
 
-    // Normalize and prepare inputs
-    x[0] = (float)pulseDuration / T_MAX;
-    x[1] = (float)pulseCount / 10.0;
-    x[2] = supplyVoltage / V_REF;
+    float x_in[inputSize];
+    float log_dur = log10((float)pulseDuration + 1.0);
+    x_in[0] = (log_dur - LOG_T_MIN) / 6.0; x_in[1] = (float)pulseCount / 10.0; x_in[2] = supplyVoltage / V_REF; x_in[3] = residualADC / 1023.0;
 
-    // Record history for BPTT
-    for(int i=0; i<inputSize; i++) x_history[pulseCount][i] = x[i];
-    for(int i=0; i<hiddenSize; i++) h_history[pulseCount][i] = h_prev[i];
-
-    rnnForward();
-
-    // Advance hidden state
-    for(int i=0; i<hiddenSize; i++) {
-        h_prev[i] = h[i];
-        h_history[pulseCount+1][i] = h[i];
+    if (pulseCount >= (10 - bpttSteps)) {
+        int idx = pulseCount - (10 - bpttSteps);
+        memcpy(x_history[idx], x_in, sizeof(x_in)); memcpy(h_history[idx], h_prev, sizeof(h_prev));
     }
-    pulseCount++;
+    rnnForward(x_in);
+    memcpy(h_prev, h, sizeof(h));
+    if (pulseCount >= (10 - bpttSteps)) memcpy(h_history[pulseCount - (10 - bpttSteps) + 1], h, sizeof(h));
 
-    digitalWrite(chargePin, LOW);
-    while (analogRead(analogPin) > 5) { delay(1); }
+    pulseCount++; digitalWrite(chargePin, LOW); loopStart = millis();
+    while (analogRead(analogPin) > 5) { if (millis() - loopStart > timeout_ms) break; }
   }
 
-  // 5. Output Prediction
-  float predictedR = y[0] * R_MAX;
+  float predictedR = pow(10, y[0] * 4.0 + 2.0);
+  Serial.print(F("RNN: ")); Serial.print(predictedR); Serial.println(F(" ohms"));
 
-  // Traditional calculation for user reference
-  float avgD = 0;
-  for(int i=0; i<10; i++) avgD += x_history[i][0] * T_MAX;
-  float calculatedR = (avgD/10.0 / 1000000.0) / knownCapacitor;
-
-  Serial.print(F("Traditional Calc: "));
-  Serial.print(calculatedR);
-  Serial.print(F(" ohms | RNN Estimation: "));
-  Serial.print(predictedR);
-  Serial.println(F(" ohms"));
-
-  // 6. Handle Training in Calibration Mode
   if (calibrationMode) {
-    Serial.println(F("Enter GROUND TRUTH R (ohms):"));
-    while (Serial.available() == 0) { delay(10); }
+    Serial.println(F("Target R:")); while (Serial.available() == 0) { delay(10); }
     float knownR = Serial.parseFloat();
-    if (knownR > 0) {
-        t[0] = knownR / R_MAX;
-        Serial.print(F("Training RNN on target: "));
-        Serial.println(knownR);
-        rnnBackwardAndUpdate(10);
-        Serial.println(F("Weights updated."));
-    }
+    if (knownR > 0) { float target = (log10(knownR) - 2.0) / 4.0; rnnBackwardAndUpdate(bpttSteps, target); Serial.println(F("Trained.")); }
   }
-
   delay(2000);
 }
 
-// --- RNN Logic ---
-
-void rnnForward() {
+void rnnForward(float* x_in) {
   for (int i = 0; i < hiddenSize; i++) {
     h[i] = bh[i];
-    for (int j = 0; j < inputSize; j++) h[i] += Wxh[i][j] * x[j];
+    for (int j = 0; j < inputSize; j++) h[i] += Wxh[i][j] * x_in[j];
     for (int k = 0; k < hiddenSize; k++) h[i] += Whh[i][k] * h_prev[k];
     h[i] = tanhf(h[i]);
   }
-  for (int i = 0; i < outputSize; i++) {
-    y[i] = by[i];
-    for (int j = 0; j < hiddenSize; j++) y[i] += Why[i][j] * h[j];
-  }
+  for (int i = 0; i < outputSize; i++) { y[i] = by[i]; for (int j = 0; j < hiddenSize; j++) y[i] += Why[i][j] * h[j]; }
 }
 
-float clip(float val) {
-    if (val > gradClip) return gradClip;
-    if (val < -gradClip) return -gradClip;
-    return val;
-}
+void rnnBackwardAndUpdate(int steps, float target) {
+    float dy = y[0] - target;
+    float dh_next[hiddenSize]; memset(dh_next, 0, sizeof(dh_next));
+    static float dWxh[hiddenSize][inputSize], dWhh[hiddenSize][hiddenSize], dWhy[outputSize][hiddenSize], dbh[hiddenSize], dby[outputSize];
+    memset(dWxh, 0, sizeof(dWxh)); memset(dWhh, 0, sizeof(dWhh)); memset(dWhy, 0, sizeof(dWhy)); memset(dbh, 0, sizeof(dbh)); memset(dby, 0, sizeof(dby));
 
-void rnnBackwardAndUpdate(int steps) {
-    float dy[outputSize];
-    float dh[hiddenSize];
-    float dh_next[hiddenSize];
-    for(int i=0; i<hiddenSize; i++) dh_next[i] = 0;
+    dby[0] = dy; for (int j = 0; j < hiddenSize; j++) dWhy[0][j] = dy * h_history[steps][j];
 
-    // Gradient Accumulators
-    float dWxh[hiddenSize][inputSize] = {0};
-    float dWhh[hiddenSize][hiddenSize] = {0};
-    float dWhy[outputSize][hiddenSize] = {0};
-    float dbh[hiddenSize] = {0};
-    float dby[outputSize] = {0};
-
-    // Error at output (many-to-one architecture)
-    for (int i = 0; i < outputSize; i++) {
-        dy[i] = y[i] - t[i];
-        dby[i] = dy[i];
-        for (int j = 0; j < hiddenSize; j++) dWhy[i][j] = dy[i] * h_history[steps][j];
-    }
-
-    // Backprop Through Time (BPTT) loop
-    for (int t_step = steps - 1; t_step >= 0; t_step--) {
+    for (int t = steps - 1; t >= 0; t--) {
+        float dh[hiddenSize];
         for (int i = 0; i < hiddenSize; i++) {
-            dh[i] = dh_next[i];
-            if (t_step == steps - 1) {
-                for (int j = 0; j < outputSize; j++) dh[i] += Why[j][i] * dy[j];
-            }
-            // Tanh derivative applied to total error flowing to this hidden unit
-            float dtanh = (1.0 - h_history[t_step+1][i] * h_history[t_step+1][i]);
-            dh[i] *= dtanh;
-
+            dh[i] = dh_next[i] + Why[0][i] * (t == steps - 1 ? dy : 0);
+            dh[i] *= (1.0 - h_history[t+1][i] * h_history[t+1][i]); // Tanh derivative
             dbh[i] += dh[i];
-            for (int j = 0; j < inputSize; j++) dWxh[i][j] += dh[i] * x_history[t_step][j];
-            for (int k = 0; k < hiddenSize; k++) dWhh[i][k] += dh[i] * h_history[t_step][k];
+            for (int j = 0; j < inputSize; j++) dWxh[i][j] += dh[i] * x_history[t][j];
+            for (int k = 0; k < hiddenSize; k++) dWhh[i][k] += dh[i] * h_history[t][k];
         }
-        // Flow error to previous time step
-        for(int i=0; i<hiddenSize; i++) {
+        // Correct BPTT: Aggregated dh_next for the PREVIOUS step
+        for (int i = 0; i < hiddenSize; i++) {
             dh_next[i] = 0;
-            for(int j=0; j<hiddenSize; j++) dh_next[i] += Whh[j][i] * dh[j];
+            for (int j = 0; j < hiddenSize; j++) dh_next[i] += Whh[j][i] * dh[j];
         }
     }
 
-    // Optimizer Update: SGD with Momentum and Gradient Clipping
+    auto upd = [&](float& w, float& g, float& s) { g = (g > 1.0 ? 1.0 : (g < -1.0 ? -1.0 : g)) + l2Reg * w; s = rho * s + (1 - rho) * g * g; w -= learningRate * g / (sqrt(s) + epsilon); };
     for (int i = 0; i < hiddenSize; i++) {
-        vbh[i] = momentum * vbh[i] - learningRate * clip(dbh[i]);
-        bh[i] += vbh[i];
-        for (int j = 0; j < inputSize; j++) {
-            vWxh[i][j] = momentum * vWxh[i][j] - learningRate * clip(dWxh[i][j]);
-            Wxh[i][j] += vWxh[i][j];
-        }
-        for (int k = 0; k < hiddenSize; k++) {
-            vWhh[i][k] = momentum * vWhh[i][k] - learningRate * clip(dWhh[i][k]);
-            Whh[i][k] += vWhh[i][k];
-        }
+        upd(bh[i], dbh[i], sbh[i]);
+        for (int j = 0; j < inputSize; j++) upd(Wxh[i][j], dWxh[i][j], sWxh[i][j]);
+        for (int k = 0; k < hiddenSize; k++) upd(Whh[i][k], dWhh[i][k], sWhh[i][k]);
+        upd(Why[0][i], dWhy[0][i], sWhy[0][i]);
     }
-    for (int i = 0; i < outputSize; i++) {
-        vby[i] = momentum * vby[i] - learningRate * clip(dby[i]);
-        by[i] += vby[i];
-        for (int j = 0; j < hiddenSize; j++) {
-            vWhy[i][j] = momentum * vWhy[i][j] - learningRate * clip(dWhy[i][j]);
-            Why[i][j] += vWhy[i][j];
-        }
-    }
+    upd(by[0], dby[0], sby[0]);
 }
 
 void rnnInit() {
-  float scale = 0.1; // Small random initialization
+  float sc = sqrt(2.0 / (inputSize + 2 * hiddenSize));
   for (int i = 0; i < hiddenSize; i++) {
-    bh[i] = 0; vbh[i] = 0;
-    for (int j = 0; j < inputSize; j++) {
-        Wxh[i][j] = (random(-1000, 1000) / 1000.0) * scale;
-        vWxh[i][j] = 0;
-    }
-    for (int k = 0; k < hiddenSize; k++) {
-        Whh[i][k] = (random(-1000, 1000) / 1000.0) * scale;
-        vWhh[i][k] = 0;
-    }
+    bh[i] = 0; sbh[i] = 0;
+    for (int j = 0; j < inputSize; j++) { Wxh[i][j] = (random(-1000, 1000) / 1000.0) * sc; sWxh[i][j] = 0; }
+    for (int k = 0; k < hiddenSize; k++) { Whh[i][k] = (random(-1000, 1000) / 1000.0) * sc; sWhh[i][k] = 0; }
+    Why[0][i] = (random(-1000, 1000) / 1000.0) * sc; sWhy[0][i] = 0;
   }
-  for (int i = 0; i < outputSize; i++) {
-    by[i] = 0; vby[i] = 0;
-    for (int j = 0; j < hiddenSize; j++) {
-        Why[i][j] = (random(-1000, 1000) / 1000.0) * scale;
-        vWhy[i][j] = 0;
-    }
-  }
+  by[0] = 0; sby[0] = 0;
 }
 
-void rnnReset() {
-  for (int i = 0; i < hiddenSize; i++) {
-    h[i] = 0;
-    h_prev[i] = 0;
-    for(int t=0; t<11; t++) h_history[t][i] = 0;
-  }
-}
+void rnnReset() { for (int i = 0; i < hiddenSize; i++) { h[i] = 0; h_prev[i] = 0; } memset(h_history, 0, sizeof(h_history)); }
+void saveWeights() { int addr = 0; EEPROM.put(addr, Wxh); addr += sizeof(Wxh); EEPROM.put(addr, Whh); addr += sizeof(Whh); EEPROM.put(addr, Why); addr += sizeof(Why); EEPROM.put(addr, bh); addr += sizeof(bh); EEPROM.put(addr, by); addr += sizeof(by); }
+bool loadWeights() { int addr = 0; EEPROM.get(addr, Wxh); if(isnan(Wxh[0][0]) || isinf(Wxh[0][0])) return false; addr += sizeof(Wxh); EEPROM.get(addr, Whh); addr += sizeof(Whh); EEPROM.get(addr, Why); addr += sizeof(Why); EEPROM.get(addr, bh); addr += sizeof(bh); EEPROM.get(addr, by); addr += sizeof(by); return true; }
